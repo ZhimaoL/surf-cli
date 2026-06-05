@@ -22,6 +22,8 @@ var embeddedAPIsJSON []byte
 var version = "dev"
 var configDir string
 
+const defaultSurfGatewayBase = "https://api.asksurf.ai/gateway"
+
 func main() {
 	// Force config and cache to ~/.surf/ on all platforms.
 	home, err := os.UserHomeDir()
@@ -59,6 +61,7 @@ func main() {
 	// Initialize restish.
 	cli.Init("surf", version)
 	cli.Defaults()
+	applySurfAPIBaseURLOverride()
 	cli.AddLoader(openapi.New())
 
 	// Send Cobra diagnostics (deprecation warnings, usage errors) to stderr
@@ -197,7 +200,7 @@ func main() {
 	if cli.LoadCachedAPI("surf") == nil && needsCachedAPI() {
 		fmt.Fprintln(os.Stderr, "No cached API spec, syncing...")
 		viper.Set("rsh-no-cache", true)
-		if _, err := cli.Load("https://api.asksurf.ai/gateway", cli.Root); err != nil {
+		if _, err := cli.Load(currentSurfGatewayBase(), cli.Root); err != nil {
 			fmt.Fprintf(os.Stderr, "Auto-sync failed: %v\n", err)
 			// Fall through — the downstream "no cached API spec" /
 			// "unknown command" path will produce a more specific error.
@@ -255,11 +258,8 @@ func needsCachedAPI() bool {
 		"help": true, "completion": true, "version": true, "install": true,
 		"telemetry": true, "feedback": true,
 	}
-	for _, arg := range os.Args[1:] {
-		if strings.HasPrefix(arg, "-") {
-			continue
-		}
-		return !meta[arg]
+	if cmd := firstCommandArg(os.Args); cmd != "" {
+		return !meta[cmd]
 	}
 	// No command given → will show root help, no sync needed.
 	return false
@@ -282,14 +282,121 @@ func shouldInjectAPIName() bool {
 			return false
 		}
 	}
-	for _, arg := range os.Args[1:] {
-		if strings.HasPrefix(arg, "-") {
-			continue
-		}
-		return !local[arg]
+	if cmd := firstCommandArg(os.Args); cmd != "" {
+		return !local[cmd]
 	}
 	// No non-flag args → show help, no injection.
 	return false
+}
+
+func firstCommandArg(argv []string) string {
+	for i := 1; i < len(argv); i++ {
+		arg := argv[i]
+		if arg == "--" {
+			if i+1 < len(argv) {
+				return argv[i+1]
+			}
+			return ""
+		}
+		if strings.HasPrefix(arg, "--") {
+			if flagConsumesValue(arg) && !strings.Contains(arg, "=") {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			if shortFlagConsumesValue(arg) && len(arg) == 2 {
+				i++
+			}
+			continue
+		}
+		return arg
+	}
+	return ""
+}
+
+func flagConsumesValue(arg string) bool {
+	name := strings.TrimPrefix(arg, "--")
+	if idx := strings.Index(name, "="); idx >= 0 {
+		name = name[:idx]
+	}
+	switch name {
+	case "surf-api-base-url", "rsh-output-format", "rsh-filter", "rsh-header",
+		"rsh-query", "rsh-profile", "rsh-client-cert", "rsh-client-key",
+		"rsh-ca-cert", "rsh-retry", "rsh-timeout", "category":
+		return true
+	default:
+		return false
+	}
+}
+
+func shortFlagConsumesValue(arg string) bool {
+	name := strings.TrimPrefix(arg, "-")
+	if idx := strings.Index(name, "="); idx >= 0 {
+		name = name[:idx]
+	}
+	switch name {
+	case "s", "o", "f", "H", "q", "p", "t", "c":
+		return true
+	default:
+		return false
+	}
+}
+
+func explicitSurfAPIBaseURLOverride(args []string) string {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case strings.HasPrefix(arg, "--surf-api-base-url="):
+			return strings.TrimPrefix(arg, "--surf-api-base-url=")
+		case arg == "--surf-api-base-url" && i+1 < len(args):
+			return args[i+1]
+		case strings.HasPrefix(arg, "-s="):
+			return strings.TrimPrefix(arg, "-s=")
+		case arg == "-s" && i+1 < len(args):
+			return args[i+1]
+		case strings.HasPrefix(arg, "-s") && len(arg) > 2:
+			return strings.TrimPrefix(arg, "-s")
+		}
+	}
+	return os.Getenv("SURF_API_BASE_URL")
+}
+
+func normalizeSurfGatewayBase(raw string) string {
+	base := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if strings.HasSuffix(base, "/v1") {
+		base = strings.TrimSuffix(base, "/v1")
+	}
+	return base
+}
+
+func surfSpecFile(base string) string {
+	return strings.TrimRight(base, "/") + "/openapi.json"
+}
+
+func applySurfAPIBaseURLOverride() {
+	raw := explicitSurfAPIBaseURLOverride(os.Args[1:])
+	if raw == "" {
+		return
+	}
+	base := normalizeSurfGatewayBase(raw)
+	if base == "" {
+		return
+	}
+	viper.Set("surf-api-base-url", raw)
+	cli.OverrideAPIConfig("surf", base, []string{surfSpecFile(base)})
+}
+
+func currentSurfGatewayBase() string {
+	if raw := explicitSurfAPIBaseURLOverride(os.Args[1:]); raw != "" {
+		if base := normalizeSurfGatewayBase(raw); base != "" {
+			return base
+		}
+	}
+	if base := cli.APIBase("surf"); base != "" {
+		return strings.TrimRight(base, "/")
+	}
+	return defaultSurfGatewayBase
 }
 
 func removeCommands(root *cobra.Command, names ...string) {
@@ -398,8 +505,11 @@ func newSyncCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			viper.Set("rsh-no-cache", true)
-			if _, err := cli.Load("https://api.asksurf.ai/gateway", cli.Root); err != nil {
+			if _, err := cli.Load(currentSurfGatewayBase(), cli.Root); err != nil {
 				return fmt.Errorf("sync failed: %w", err)
+			}
+			if cli.LoadCachedAPI("surf") == nil {
+				return fmt.Errorf("sync failed: cached API spec was not written")
 			}
 			fmt.Fprintln(os.Stderr, "API spec synced.")
 			return nil

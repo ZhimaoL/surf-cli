@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,18 +16,143 @@ import (
 // commands are registered from the cache.
 func buildSurfBin(t *testing.T) string {
 	t.Helper()
-	bin := t.TempDir() + "/surf"
-	build := exec.Command("go", "build", "-o", bin, ".")
-	build.Dir = "."
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build failed: %v\n%s", err, out)
-	}
+	bin := buildBareSurfBin(t)
 
 	home, _ := os.UserHomeDir()
 	if _, err := os.Stat(home + "/.surf/surf.cbor"); os.IsNotExist(err) {
 		t.Skip("no cached API spec — run `surf sync` first")
 	}
 	return bin
+}
+
+func buildBareSurfBin(t *testing.T) string {
+	t.Helper()
+	bin := t.TempDir() + "/surf"
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = "."
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build failed: %v\n%s", err, out)
+	}
+	return bin
+}
+
+func testOpenAPISpec(operationID, summary string) string {
+	return fmt.Sprintf(`{
+  "openapi": "3.0.0",
+  "info": {"title": "Surf Test API", "version": "1.0.0"},
+  "paths": {
+    "/gateway/v1/%s": {
+      "get": {
+        "operationId": "%s",
+        "summary": "%s",
+        "tags": ["test"],
+        "parameters": [
+          {"name": "address", "in": "query", "schema": {"type": "string"}}
+        ],
+        "responses": {"200": {"description": "ok"}}
+      }
+    }
+  }
+}`, operationID, operationID, summary)
+}
+
+func newSpecServer(t *testing.T, operationID string) (*httptest.Server, *[]string) {
+	t.Helper()
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path != "/gateway/openapi.json" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, testOpenAPISpec(operationID, operationID+" summary"))
+	}))
+	return srv, &paths
+}
+
+func runSurf(t *testing.T, bin string, home string, env []string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command(bin, args...)
+	cmd.Env = append(os.Environ(), "HOME="+home, "SURF_API_BASE_URL=", "SURF_TELEMETRY_DISABLED=1")
+	cmd.Env = append(cmd.Env, env...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("surf %s failed: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
+}
+
+func TestSyncUsesSurfAPIBaseURLEnv(t *testing.T) {
+	bin := buildBareSurfBin(t)
+	home := t.TempDir()
+	srv, paths := newSpecServer(t, "hyperliquidAccount")
+	defer srv.Close()
+
+	env := []string{"SURF_API_BASE_URL=" + srv.URL + "/gateway/v1"}
+	out := runSurf(t, bin, home, env, "sync")
+	if !strings.Contains(out, "API spec synced.") {
+		t.Fatalf("sync output missing success message:\n%s", out)
+	}
+	if _, err := os.Stat(home + "/.surf/surf.cbor"); err != nil {
+		t.Fatalf("expected surf.cbor cache to be written: %v", err)
+	}
+	if got := strings.Join(*paths, ","); got != "/gateway/openapi.json" {
+		t.Fatalf("sync should fetch env-specific OpenAPI spec, got paths %q", got)
+	}
+
+	out = runSurf(t, bin, home, env, "list-operations")
+	if !strings.Contains(out, "hyperliquid-account") {
+		t.Fatalf("list-operations missing env-specific operation:\n%s", out)
+	}
+}
+
+func TestSyncUsesConfiguredSurfAPIBase(t *testing.T) {
+	bin := buildBareSurfBin(t)
+	home := t.TempDir()
+	surfDir := home + "/.surf"
+	if err := os.MkdirAll(surfDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	srv, _ := newSpecServer(t, "configuredOnly")
+	defer srv.Close()
+
+	apisJSON := fmt.Sprintf(`{
+  "$schema": "https://rest.sh/schemas/apis.json",
+  "surf": {
+    "base": %q,
+    "spec_files": [%q],
+    "profiles": {"default": {}}
+  }
+}`, srv.URL+"/gateway", srv.URL+"/gateway/openapi.json")
+	if err := os.WriteFile(surfDir+"/apis.json", []byte(apisJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runSurf(t, bin, home, nil, "sync")
+	out := runSurf(t, bin, home, nil, "list-operations")
+	if !strings.Contains(out, "configured-only") {
+		t.Fatalf("list-operations missing configured operation:\n%s", out)
+	}
+}
+
+func TestCachedSpecIsScopedToSurfAPIBaseURL(t *testing.T) {
+	bin := buildBareSurfBin(t)
+	home := t.TempDir()
+	prodSrv, _ := newSpecServer(t, "prodOnly")
+	defer prodSrv.Close()
+	stgSrv, _ := newSpecServer(t, "stgOnly")
+	defer stgSrv.Close()
+
+	runSurf(t, bin, home, []string{"SURF_API_BASE_URL=" + prodSrv.URL + "/gateway/v1"}, "sync")
+
+	out := runSurf(t, bin, home, []string{"SURF_API_BASE_URL=" + stgSrv.URL + "/gateway/v1"}, "list-operations")
+	if !strings.Contains(out, "stg-only") {
+		t.Fatalf("expected cache miss and STG resync, got:\n%s", out)
+	}
+	if strings.Contains(out, "prod-only") {
+		t.Fatalf("reused cached operations from the previous base:\n%s", out)
+	}
 }
 
 // TestNoDoubleSurfInUsage builds the surf binary and verifies that
