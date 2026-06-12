@@ -182,7 +182,10 @@ func Load(entrypoint string, root *cobra.Command) (API, error) {
 		filename := filepath.Join(getCacheDir(), name+".cbor")
 		if data, err := os.ReadFile(filename); err == nil {
 			if err := cbor.Unmarshal(data, &cached); err == nil {
-				if cached.RestishVersion == root.Version {
+				// API subcommands do not carry the root CLI version, but they still
+				// need to reuse the already-validated cache instead of refreshing the
+				// spec on every operation invocation.
+				if root.Version == "" || cached.RestishVersion == root.Version {
 					setupRootFromAPI(root, &cached)
 					return cached, nil
 				}

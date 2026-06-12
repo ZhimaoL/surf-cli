@@ -43,9 +43,18 @@ func buildBareSurfBin(t *testing.T) string {
 }
 
 func testOpenAPISpec(operationID, summary string) string {
+	return testOpenAPISpecWithServer(operationID, summary, "")
+}
+
+func testOpenAPISpecWithServer(operationID, summary string, serverURL string) string {
+	serverBlock := ""
+	if serverURL != "" {
+		serverBlock = fmt.Sprintf(`,
+  "servers": [{"url": %q}]`, serverURL)
+	}
 	return fmt.Sprintf(`{
   "openapi": "3.0.0",
-  "info": {"title": "Surf Test API", "version": "1.0.0"},
+  "info": {"title": "Surf Test API", "version": "1.0.0"}%s,
   "paths": {
     "/gateway/v1/%s": {
       "get": {
@@ -59,29 +68,61 @@ func testOpenAPISpec(operationID, summary string) string {
       }
     }
   }
-}`, operationID, operationID, summary)
+}`, serverBlock, operationID, operationID, summary)
 }
 
 func newSpecServer(t *testing.T, operationID string) (*httptest.Server, *[]string) {
 	t.Helper()
+	return newSpecAndOperationServer(t, operationID, nil)
+}
+
+func newSpecAndOperationServer(t *testing.T, operationID string, operationHandler http.HandlerFunc) (*httptest.Server, *[]string) {
+	return newSpecAndOperationServerWithOpenAPIServer(t, operationID, "", operationHandler)
+}
+
+func newSpecAndOperationServerWithOpenAPIServer(t *testing.T, operationID string, serverURL string, operationHandler http.HandlerFunc) (*httptest.Server, *[]string) {
+	t.Helper()
 	var paths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
-		if r.URL.Path != "/gateway/openapi.json" {
-			http.NotFound(w, r)
+		if r.URL.Path == "/gateway/openapi.json" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, testOpenAPISpecWithServer(operationID, operationID+" summary", serverURL))
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, testOpenAPISpec(operationID, operationID+" summary"))
+		if operationHandler != nil {
+			operationHandler(w, r)
+			return
+		}
+		http.NotFound(w, r)
 	}))
 	return srv, &paths
 }
 
-func runSurf(t *testing.T, bin string, home string, env []string, args ...string) string {
+func surfCmd(t *testing.T, bin string, home string, env []string, args ...string) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command(bin, args...)
-	cmd.Env = append(os.Environ(), "HOME="+home, "SURF_API_BASE_URL=", "SURF_TELEMETRY_DISABLED=1")
+	cmd.Env = append(os.Environ(),
+		"HOME="+home,
+		"USERPROFILE="+home,
+		"SURF_API_BASE_URL=",
+		"SURF_TELEMETRY_DISABLED=1",
+		"HTTP_PROXY=",
+		"HTTPS_PROXY=",
+		"ALL_PROXY=",
+		"NO_PROXY=*",
+		"http_proxy=",
+		"https_proxy=",
+		"all_proxy=",
+		"no_proxy=*",
+	)
 	cmd.Env = append(cmd.Env, env...)
+	return cmd
+}
+
+func runSurf(t *testing.T, bin string, home string, env []string, args ...string) string {
+	t.Helper()
+	cmd := surfCmd(t, bin, home, env, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("surf %s failed: %v\n%s", strings.Join(args, " "), err, out)
@@ -376,10 +417,15 @@ func TestVersionFlag(t *testing.T) {
 
 // TestDebugFlag verifies that --debug enables debug logging to stderr.
 func TestDebugFlag(t *testing.T) {
-	bin := buildSurfBin(t)
+	bin := buildBareSurfBin(t)
+	home := t.TempDir()
+	srv, _ := newSpecServer(t, "marketPrice")
+	defer srv.Close()
 
-	cmd := exec.Command(bin, "--debug", "market-price", "--symbol", "BTC",
-		"--surf-api-base-url", "http://127.0.0.1:1", "--rsh-retry", "0")
+	env := []string{"SURF_API_BASE_URL=" + srv.URL + "/gateway/v1"}
+	runSurf(t, bin, home, env, "sync")
+
+	cmd := surfCmd(t, bin, home, env, "--debug", "market-price", "--address", "BTC", "--rsh-retry", "0")
 	out, _ := cmd.CombinedOutput()
 	if !strings.Contains(string(out), "DEBUG:") {
 		t.Errorf("--debug should produce DEBUG: lines, got:\n%s", string(out))
@@ -388,10 +434,11 @@ func TestDebugFlag(t *testing.T) {
 
 // TestQuietFlag verifies that --quiet suppresses WARN/INFO but not errors.
 func TestQuietFlag(t *testing.T) {
-	bin := buildSurfBin(t)
+	bin := buildBareSurfBin(t)
+	home := t.TempDir()
 
 	t.Run("errors still show", func(t *testing.T) {
-		cmd := exec.Command(bin, "--quiet", "market-price", "--bogus")
+		cmd := surfCmd(t, bin, home, nil, "--quiet", "auth", "--bogus")
 		out, _ := cmd.CombinedOutput()
 		if !strings.Contains(string(out), "unknown flag") {
 			t.Errorf("--quiet should still show errors, got:\n%s", string(out))
@@ -399,24 +446,26 @@ func TestQuietFlag(t *testing.T) {
 	})
 
 	// Spin up a server that always returns 429 to trigger retry WARN lines.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv, _ := newSpecAndOperationServer(t, "marketPrice", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "0")
 		w.WriteHeader(http.StatusTooManyRequests)
-	}))
+	})
 	defer srv.Close()
 
-	args := []string{"market-price", "--symbol", "BTC", "--time-range", "1d",
-		"--surf-api-base-url", srv.URL, "--rsh-retry", "1"}
+	env := []string{"SURF_API_BASE_URL=" + srv.URL + "/gateway/v1"}
+	runSurf(t, bin, home, env, "sync")
+
+	args := []string{"market-price", "--address", "BTC", "--rsh-retry", "1"}
 
 	t.Run("without --quiet shows WARN", func(t *testing.T) {
-		out, _ := exec.Command(bin, args...).CombinedOutput()
+		out, _ := surfCmd(t, bin, home, env, args...).CombinedOutput()
 		if !strings.Contains(string(out), "WARN:") {
 			t.Errorf("expected WARN: line on 429 retry, got:\n%s", string(out))
 		}
 	})
 
 	t.Run("--quiet suppresses WARN", func(t *testing.T) {
-		out, _ := exec.Command(bin, append([]string{"--quiet"}, args...)...).CombinedOutput()
+		out, _ := surfCmd(t, bin, home, env, append([]string{"--quiet"}, args...)...).CombinedOutput()
 		if strings.Contains(string(out), "WARN:") {
 			t.Errorf("--quiet should suppress WARN:, got:\n%s", string(out))
 		}
