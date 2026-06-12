@@ -6,7 +6,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -27,7 +29,11 @@ func buildSurfBin(t *testing.T) string {
 
 func buildBareSurfBin(t *testing.T) string {
 	t.Helper()
-	bin := t.TempDir() + "/surf"
+	binName := "surf"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	bin := filepath.Join(t.TempDir(), binName)
 	build := exec.Command("go", "build", "-o", bin, ".")
 	build.Dir = "."
 	if out, err := build.CombinedOutput(); err != nil {
