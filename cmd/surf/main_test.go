@@ -56,6 +56,21 @@ func TestShouldInjectAPIName(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "leading surf API base URL before sync does not inject",
+			args: []string{"surf", "--surf-api-base-url", "https://api.stg.ask.surf/gateway/v1", "sync"},
+			want: false,
+		},
+		{
+			name: "leading surf API base URL before operation still injects",
+			args: []string{"surf", "--surf-api-base-url", "https://api.stg.ask.surf/gateway/v1", "wallet-labels-batch"},
+			want: true,
+		},
+		{
+			name: "leading surf API base URL shorthand before operation still injects",
+			args: []string{"surf", "-s", "https://api.stg.ask.surf/gateway/v1", "wallet-labels-batch"},
+			want: true,
+		},
+		{
 			name: "leading flags before operation with --help do NOT inject",
 			args: []string{"surf", "-o", "json", "wallet-labels-batch", "--help"},
 			want: false,
@@ -95,6 +110,10 @@ func TestNeedsCachedAPI(t *testing.T) {
 		{"API command with --help needs cache", []string{"surf", "polymarket-markets", "--help"}, true},
 		{"leading flags skipped when finding command", []string{"surf", "--debug", "polymarket-markets"}, true},
 		{"leading flags skipped before meta command", []string{"surf", "--debug", "auth"}, false},
+		{"leading surf API base URL skipped before sync", []string{"surf", "--surf-api-base-url", "https://api.stg.ask.surf/gateway/v1", "sync"}, false},
+		{"leading surf API base URL skipped before API command", []string{"surf", "--surf-api-base-url", "https://api.stg.ask.surf/gateway/v1", "polymarket-markets"}, true},
+		{"leading surf API base URL equals form skipped before list", []string{"surf", "--surf-api-base-url=https://api.stg.ask.surf/gateway/v1", "list-operations"}, true},
+		{"leading surf API base URL shorthand skipped before sync", []string{"surf", "-s", "https://api.stg.ask.surf/gateway/v1", "sync"}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
